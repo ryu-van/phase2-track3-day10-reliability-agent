@@ -1,0 +1,11 @@
+{
+  "avg_get_latency_ms": 0.891,
+  "avg_set_latency_ms": 0.106,
+  "avg_hit_latency_ms": 0.961,
+  "avg_miss_latency_ms": 0.395,
+  "p95_get_latency_ms": 2.383,
+  "total_get_ops": 8,
+  "total_set_ops": 5,
+  "cache_hits": 7,
+  "cache_misses": 1
+}

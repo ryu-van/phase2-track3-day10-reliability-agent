@@ -62,7 +62,24 @@ def calculate_recovery_time_ms(gateway: ReliabilityGateway) -> float | None:
     Each transition_log entry is a dict with keys: "from", "to", "reason", "ts"
     where "ts" is time.time() (epoch seconds).
     """
-    raise NotImplementedError("TODO: implement calculate_recovery_time_ms()")
+    recovery_times = []
+    open_ts = None
+    
+    for breaker in gateway.breakers.values():
+        open_ts = None
+        for log_entry in breaker.transition_log:
+            if log_entry.get("to") == "open":
+                open_ts = log_entry.get("ts")
+            elif log_entry.get("to") == "closed" and open_ts is not None:
+                close_ts = log_entry.get("ts")
+                recovery_time = (close_ts - open_ts) * 1000  # convert to ms
+                recovery_times.append(recovery_time)
+                open_ts = None
+    
+    if not recovery_times:
+        return None
+    
+    return sum(recovery_times) / len(recovery_times)
 
 
 def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig) -> RunMetrics:
@@ -86,7 +103,49 @@ def run_scenario(config: LabConfig, queries: list[str], scenario: ScenarioConfig
     5. Set recovery_time_ms via calculate_recovery_time_ms(gateway)
     6. Return metrics
     """
-    raise NotImplementedError("TODO: implement run_scenario()")
+    # Build gateway
+    gateway = build_gateway(config, scenario.provider_overrides or None)
+    
+    # Create empty metrics
+    metrics = RunMetrics()
+    
+    # Loop for load test
+    for _ in range(config.load_test.requests):
+        prompt = random.choice(queries)
+        result = gateway.complete(prompt)
+        
+        # Update metrics
+        metrics.total_requests += 1
+        metrics.estimated_cost += result.estimated_cost
+        
+        if result.cache_hit:
+            metrics.cache_hits += 1
+            metrics.estimated_cost_saved += 0.001
+        
+        if result.route == "fallback":
+            metrics.fallback_successes += 1
+            metrics.successful_requests += 1
+        elif result.route == "static_fallback":
+            metrics.static_fallbacks += 1
+            metrics.failed_requests += 1
+        elif result.route.startswith("cache_hit:"):
+            metrics.successful_requests += 1
+        else:  # primary
+            metrics.successful_requests += 1
+        
+        if result.latency_ms > 0:
+            metrics.latencies_ms.append(result.latency_ms)
+    
+    # Count circuit opens
+    for breaker in gateway.breakers.values():
+        for log_entry in breaker.transition_log:
+            if log_entry.get("to") == "open":
+                metrics.circuit_open_count += 1
+    
+    # Calculate recovery time
+    metrics.recovery_time_ms = calculate_recovery_time_ms(gateway)
+    
+    return metrics
 
 
 def run_simulation(config: LabConfig, queries: list[str]) -> RunMetrics:

@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import re
 import time
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any
+import math
 
 # ---------------------------------------------------------------------------
 # Shared utilities — use these in both ResponseCache and SharedRedisCache
@@ -53,6 +55,13 @@ class ResponseCache:
         self.ttl_seconds = ttl_seconds
         self.similarity_threshold = similarity_threshold
         self._entries: list[CacheEntry] = []
+        self.false_hit_log: list[dict[str, object]] = []
+        
+        # Cache operation timing metrics
+        self.get_latency_ms: list[float] = []
+        self.set_latency_ms: list[float] = []
+        self.hit_latency_ms: list[float] = []
+        self.miss_latency_ms: list[float] = []
 
     def get(self, query: str) -> tuple[str | None, float]:
         """Look up a cached response by semantic similarity.
@@ -70,7 +79,48 @@ class ResponseCache:
         You'll need a self.false_hit_log: list[dict[str, object]] attribute
         (add it in __init__).
         """
-        raise NotImplementedError("TODO: implement get()")
+        start_time = time.perf_counter()
+        
+        # Privacy check
+        if _is_uncacheable(query):
+            return None, 0.0
+        
+        # Evict expired entries
+        now = time.time()
+        self._entries = [e for e in self._entries if now - e.created_at <= self.ttl_seconds]
+        
+        # Find best match
+        best_score = 0.0
+        best_entry = None
+        
+        for entry in self._entries:
+            score = self.similarity(query, entry.key)
+            if score > best_score:
+                best_score = score
+                best_entry = entry
+        
+        # Record timing
+        latency_ms = (time.perf_counter() - start_time) * 1000
+        self.get_latency_ms.append(latency_ms)
+        
+        # Check if above threshold
+        if best_score >= self.similarity_threshold and best_entry is not None:
+            # Check for false hit
+            if _looks_like_false_hit(query, best_entry.key):
+                self.false_hit_log.append({
+                    "query": query,
+                    "cached_key": best_entry.key,
+                    "score": best_score,
+                    "reason": "date_or_number_mismatch"
+                })
+                self.miss_latency_ms.append(latency_ms)
+                return None, best_score
+            
+            self.hit_latency_ms.append(latency_ms)
+            return best_entry.value, best_score
+        
+        self.miss_latency_ms.append(latency_ms)
+        return None, best_score
 
     def set(self, query: str, value: str, metadata: dict[str, str] | None = None) -> None:
         """Store a response in cache.
@@ -79,7 +129,56 @@ class ResponseCache:
         1. Return immediately if _is_uncacheable(query)
         2. Append a CacheEntry to self._entries
         """
-        raise NotImplementedError("TODO: implement set()")
+        start_time = time.perf_counter()
+        
+        if _is_uncacheable(query):
+            return
+        
+        self._entries.append(CacheEntry(
+            key=query,
+            value=value,
+            created_at=time.time(),
+            metadata=metadata or {}
+        ))
+        
+        # Record timing
+        latency_ms = (time.perf_counter() - start_time) * 1000
+        self.set_latency_ms.append(latency_ms)
+
+    def get_timing_stats(self) -> dict[str, float]:
+        """Get cache timing statistics.
+        
+        Returns:
+            Dictionary with timing metrics:
+            - avg_get_latency_ms: Average get() operation latency
+            - avg_set_latency_ms: Average set() operation latency
+            - avg_hit_latency_ms: Average latency for cache hits
+            - avg_miss_latency_ms: Average latency for cache misses
+            - p95_get_latency_ms: 95th percentile get latency
+            - total_get_ops: Total get operations
+            - total_set_ops: Total set operations
+        """
+        def avg(lst: list[float]) -> float:
+            return sum(lst) / len(lst) if lst else 0.0
+        
+        def p95(lst: list[float]) -> float:
+            if not lst:
+                return 0.0
+            sorted_lst = sorted(lst)
+            idx = int(len(sorted_lst) * 0.95)
+            return sorted_lst[idx] if idx < len(sorted_lst) else sorted_lst[-1]
+        
+        return {
+            "avg_get_latency_ms": round(avg(self.get_latency_ms), 3),
+            "avg_set_latency_ms": round(avg(self.set_latency_ms), 3),
+            "avg_hit_latency_ms": round(avg(self.hit_latency_ms), 3),
+            "avg_miss_latency_ms": round(avg(self.miss_latency_ms), 3),
+            "p95_get_latency_ms": round(p95(self.get_latency_ms), 3),
+            "total_get_ops": len(self.get_latency_ms),
+            "total_set_ops": len(self.set_latency_ms),
+            "cache_hits": len(self.hit_latency_ms),
+            "cache_misses": len(self.miss_latency_ms),
+        }
 
     @staticmethod
     def similarity(a: str, b: str) -> float:
@@ -98,7 +197,43 @@ class ResponseCache:
         Hint: Use collections.Counter and math.sqrt.
         Import them at the top of the file.
         """
-        raise NotImplementedError("TODO: implement similarity()")
+        if a == b:
+            return 1.0
+        
+        # Tokenize into words and character 3-grams
+        def tokenize(s: str) -> list[str]:
+            tokens = []
+            # Add word tokens
+            words = s.lower().split()
+            tokens.extend(words)
+            # Add character 3-grams from concatenated lowercase string
+            clean = s.lower().replace(" ", "")
+            for i in range(len(clean) - 2):
+                tokens.append(clean[i:i+3])
+            return tokens
+        
+        tokens_a = tokenize(a)
+        tokens_b = tokenize(b)
+        
+        if not tokens_a or not tokens_b:
+            return 0.0
+        
+        # Build counter vectors
+        counter_a = Counter(tokens_a)
+        counter_b = Counter(tokens_b)
+        
+        # Compute cosine similarity
+        # dot product
+        dot = sum(counter_a[token] * counter_b[token] for token in counter_a)
+        
+        # magnitude of vectors
+        mag_a = math.sqrt(sum(count ** 2 for count in counter_a.values()))
+        mag_b = math.sqrt(sum(count ** 2 for count in counter_b.values()))
+        
+        if mag_a == 0 or mag_b == 0:
+            return 0.0
+        
+        return dot / (mag_a * mag_b)
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +276,12 @@ class SharedRedisCache:
         self.prefix = prefix
         self.false_hit_log: list[dict[str, object]] = []
         self._redis: Any = redis_lib.Redis.from_url(redis_url, decode_responses=True)
+        
+        # Cache operation timing metrics
+        self.get_latency_ms: list[float] = []
+        self.set_latency_ms: list[float] = []
+        self.hit_latency_ms: list[float] = []
+        self.miss_latency_ms: list[float] = []
 
     def ping(self) -> bool:
         """Check Redis connectivity."""
@@ -163,7 +304,61 @@ class SharedRedisCache:
         7. Before returning a match, check _looks_like_false_hit(); if true,
            append to self.false_hit_log and return (None, best_score)
         """
-        return None, 0.0
+        start_time = time.perf_counter()
+        
+        if _is_uncacheable(query):
+            return None, 0.0
+        
+        # Try exact match first
+        exact_key = f"{self.prefix}{self._query_hash(query)}"
+        exact_response = self._redis.hget(exact_key, "response")
+        if exact_response is not None:
+            latency_ms = (time.perf_counter() - start_time) * 1000
+            self.get_latency_ms.append(latency_ms)
+            self.hit_latency_ms.append(latency_ms)
+            return exact_response, 1.0
+        
+        # Scan for similarity match
+        best_score = 0.0
+        best_response = None
+        best_cached_key = None
+        
+        try:
+            for key in self._redis.scan_iter(f"{self.prefix}*"):
+                cached_query = self._redis.hget(key, "query")
+                if cached_query is None:
+                    continue
+                
+                score = ResponseCache.similarity(query, cached_query)
+                if score > best_score:
+                    best_score = score
+                    best_response = self._redis.hget(key, "response")
+                    best_cached_key = cached_query
+        except Exception:
+            return None, 0.0
+        
+        # Record timing
+        latency_ms = (time.perf_counter() - start_time) * 1000
+        self.get_latency_ms.append(latency_ms)
+        
+        # Check if above threshold
+        if best_score >= self.similarity_threshold and best_response is not None:
+            # Check for false hit
+            if _looks_like_false_hit(query, best_cached_key):
+                self.false_hit_log.append({
+                    "query": query,
+                    "cached_key": best_cached_key,
+                    "score": best_score,
+                    "reason": "date_or_number_mismatch"
+                })
+                self.miss_latency_ms.append(latency_ms)
+                return None, best_score
+            
+            self.hit_latency_ms.append(latency_ms)
+            return best_response, best_score
+        
+        self.miss_latency_ms.append(latency_ms)
+        return None, best_score
 
     def set(self, query: str, value: str, metadata: dict[str, str] | None = None) -> None:
         """Store a response in Redis with TTL.
@@ -174,7 +369,18 @@ class SharedRedisCache:
         3. self._redis.hset(key, mapping={"query": query, "response": value})
         4. self._redis.expire(key, self.ttl_seconds)
         """
-        pass
+        start_time = time.perf_counter()
+        
+        if _is_uncacheable(query):
+            return
+        
+        key = f"{self.prefix}{self._query_hash(query)}"
+        self._redis.hset(key, mapping={"query": query, "response": value})
+        self._redis.expire(key, self.ttl_seconds)
+        
+        # Record timing
+        latency_ms = (time.perf_counter() - start_time) * 1000
+        self.set_latency_ms.append(latency_ms)
 
     def flush(self) -> None:
         """Remove all entries with this cache prefix (for testing)."""
@@ -185,6 +391,41 @@ class SharedRedisCache:
         """Close Redis connection."""
         if self._redis is not None:
             self._redis.close()
+
+    def get_timing_stats(self) -> dict[str, float]:
+        """Get cache timing statistics.
+        
+        Returns:
+            Dictionary with timing metrics:
+            - avg_get_latency_ms: Average get() operation latency
+            - avg_set_latency_ms: Average set() operation latency
+            - avg_hit_latency_ms: Average latency for cache hits
+            - avg_miss_latency_ms: Average latency for cache misses
+            - p95_get_latency_ms: 95th percentile get latency
+            - total_get_ops: Total get operations
+            - total_set_ops: Total set operations
+        """
+        def avg(lst: list[float]) -> float:
+            return sum(lst) / len(lst) if lst else 0.0
+        
+        def p95(lst: list[float]) -> float:
+            if not lst:
+                return 0.0
+            sorted_lst = sorted(lst)
+            idx = int(len(sorted_lst) * 0.95)
+            return sorted_lst[idx] if idx < len(sorted_lst) else sorted_lst[-1]
+        
+        return {
+            "avg_get_latency_ms": round(avg(self.get_latency_ms), 3),
+            "avg_set_latency_ms": round(avg(self.set_latency_ms), 3),
+            "avg_hit_latency_ms": round(avg(self.hit_latency_ms), 3),
+            "avg_miss_latency_ms": round(avg(self.miss_latency_ms), 3),
+            "p95_get_latency_ms": round(p95(self.get_latency_ms), 3),
+            "total_get_ops": len(self.get_latency_ms),
+            "total_set_ops": len(self.set_latency_ms),
+            "cache_hits": len(self.hit_latency_ms),
+            "cache_misses": len(self.miss_latency_ms),
+        }
 
     @staticmethod
     def _query_hash(query: str) -> str:
